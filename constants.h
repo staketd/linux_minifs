@@ -24,7 +24,7 @@
 #define FOLDER_ATTR 1
 #define FILE_ATTR 0
 
-#define DEBUG_
+//#define DEBUG_
 
 #define FILESYSTEM_FILE "filesystem"
 #endif //LINUX_2021SPRING_CONSTANTS_H

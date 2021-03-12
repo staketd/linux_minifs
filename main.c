@@ -871,6 +871,7 @@ int main(int argc, char* argv[]) {
             free(folder_inode);
             current_path = NULL;
             current_inode_index = ROOT_INODE_INDEX;
+            current_depth = 0;
         }
     }
 }
