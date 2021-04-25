@@ -1,25 +1,11 @@
 #include <stdio.h>
 #include <string.h>
-#include <inttypes.h>
-#include "constants.h"
-#include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
-#include "fs.h"
 #include <stdlib.h>
 #include <sys/stat.h>
-
-size_t min(size_t a, size_t b) {
-    return (a < b ? a : b);
-}
-
-void unmap(void* addr, size_t length) {
-    if (addr == NULL) {
-        return;
-    }
-    munmap(addr, length);
-}
-
+#include <fs/fs.h>
+#include <util.h>
 
 super_block* get_super_block(int fd) {
     return mmap(NULL, sizeof(super_block), PROT_WRITE | PROT_READ, MAP_SHARED, fd, BLOCK_SIZE);
@@ -277,13 +263,13 @@ struct dir_entry_list* get_block_dir_entry_list(int fd, size_t block_offset) {
             entry_list = calloc(1, sizeof(struct dir_entry_list));
             entry_list->head = calloc(1, sizeof(struct dir_entry_list_node));
             entry_list->tail = entry_list->head;
-            entry_list->head->entry = entry;
+            entry_list->head->entry = *entry;
             entry_list->head->next = NULL;
             continue;
         }
         entry_list->tail->next = malloc(sizeof(struct dir_entry_list_node));
         entry_list->tail = entry_list->tail->next;
-        entry_list->tail->entry = entry;
+        entry_list->tail->entry = *entry;
         entry_list->tail->next = NULL;
     }
     return entry_list;
@@ -314,7 +300,6 @@ void free_entry_dir_list_node(struct dir_entry_list_node* list) {
         return;
     }
     free_entry_dir_list_node(list->next);
-    free(list->entry);
     free(list);
 }
 
@@ -330,23 +315,12 @@ int dir_exists(struct dir_entry_list* list, const char* dir) {
     }
     struct dir_entry_list_node* now = list->head;
     while (now != NULL) {
-        if (strcmp(now->entry->name, dir) == 0) {
+        if (strcmp(now->entry.name, dir) == 0) {
             return 0;
         }
         now = now->next;
     }
     return -1;
-}
-
-void print_path(size_t dirs, char* path[]) {
-    if (dirs == 0) {
-        printf("/");
-        return;
-    }
-    for (size_t i = 0; i < dirs; ++i) {
-        printf("/");
-        printf("%s", path[i]);
-    }
 }
 
 size_t get_inode_index(struct dir_entry_list* list, const char* name) {
@@ -356,8 +330,8 @@ size_t get_inode_index(struct dir_entry_list* list, const char* name) {
 
     struct dir_entry_list_node* now = list->head;
     while (now != NULL) {
-        if (strcmp(now->entry->name, name) == 0) {
-            return now->entry->inode_index;
+        if (strcmp(now->entry.name, name) == 0) {
+            return now->entry.inode_index;
         }
         now = now->next;
     }
@@ -395,7 +369,7 @@ inode* get_inode_of_file(int fd, char* path[], size_t depth, size_t current_inod
     return get_inode_of_file(fd, &path[1], depth - 1, next_inode_index, result_index);
 }
 
-int list_directory(int fd, size_t dirs, char* path[], size_t current_inode_index) {
+int list_directory(int fd, size_t dirs, char* path[], size_t current_inode_index, struct dir_entry_list_node* response) {
     inode* inode = get_inode_of_file(fd, path, dirs, current_inode_index, NULL);
     if (inode == NULL || check_directory(inode) == 0) {
         unmap(inode, INODE_SIZE);
@@ -403,13 +377,8 @@ int list_directory(int fd, size_t dirs, char* path[], size_t current_inode_index
     }
     mappings_list* listing = get_mapping_list(fd, inode);
     struct dir_entry_list* list = get_dir_entry_list(fd, listing);
-    struct dir_entry_list_node* now = list->head;
-    while (now != NULL) {
-        printf("%s\n", now->entry->name);
-        now = now->next;
-    }
+    *response = *list->head;
     free_mappings_list(listing);
-    free_entry_dir_list(list);
     unmap(inode, INODE_SIZE);
     return 0;
 }
@@ -534,7 +503,7 @@ void set_mapping_inode(int fd, size_t inode_index, size_t mapping_id, size_t map
 
 int check_exists(struct dir_entry_list_node* node, const char* name) {
     while (node != NULL) {
-        if (strcmp(node->entry->name, name) == 0) {
+        if (strcmp(node->entry.name, name) == 0) {
             return 0;
         }
         node = node->next;
@@ -585,7 +554,7 @@ void free_path(char** path, size_t len) {
     free(path);
 }
 
-int upload_file(int fd, int file_fd, char* path[], size_t len, size_t current_inode_index) {
+int upload_file(int fd, int file_fd, char* path[], size_t len, size_t current_inode_index, size_t file_size) {
     inode* folder_inode = get_inode_of_file(fd, path, len - 1, current_inode_index, NULL);
     if (folder_inode == NULL || check_directory(folder_inode) == 0) {
         free(folder_inode);
@@ -599,11 +568,7 @@ int upload_file(int fd, int file_fd, char* path[], size_t len, size_t current_in
     if (exists == 0) {
         return -1;
     }
-    struct stat st;
-    if (fstat(file_fd, &st) == -1) {
-        return -1;
-    }
-    size_t new_inode_index = allocate_inode(fd, FILE_ATTR, st.st_size);
+    size_t new_inode_index = allocate_inode(fd, FILE_ATTR, file_size);
     dir_entry new_entry = {
             .inode_index = new_inode_index,
             .name_len = strlen(path[len - 1]),
@@ -612,8 +577,9 @@ int upload_file(int fd, int file_fd, char* path[], size_t len, size_t current_in
     add_entry(fd, folder_inode, &new_entry, new_inode_index);
 
     char buffer[BLOCK_SIZE];
-    size_t bytes_read;
-    while ((bytes_read = read(file_fd, buffer, BLOCK_SIZE)) != 0) {
+    while (file_size > 0) {
+        int bytes_read = read(file_fd, buffer, min(file_size, BLOCK_SIZE));
+        file_size -= bytes_read;
         size_t new_file_block = allocate_block(fd);
         add_block_to_inode_mapping(fd, new_file_block, new_inode_index);
         void* block = map_block(fd, new_file_block);
@@ -624,7 +590,7 @@ int upload_file(int fd, int file_fd, char* path[], size_t len, size_t current_in
     return 0;
 }
 
-int concatenate(int fd, char* path[], size_t len, size_t current_inode_index) {
+int concatenate_and_write_to_fd(int fd, char** path, size_t len, size_t current_inode_index, int write_fd) {
     inode* file_inode = get_inode_of_file(fd, path, len, current_inode_index, NULL);
     if (file_inode == NULL || check_directory(file_inode) == FOLDER_ATTR) {
         free(file_inode);
@@ -634,7 +600,7 @@ int concatenate(int fd, char* path[], size_t len, size_t current_inode_index) {
     size_t sz = file_inode->file_size;
     for (size_t i = 0; i < map_list->mapping_size; ++i) {
         void* block = map_block(fd, map_list->mappings[i]);
-        write(1, block, min(BLOCK_SIZE, sz));
+        write(write_fd, block, min(BLOCK_SIZE, sz));
         if (sz > BLOCK_SIZE) {
             sz -= BLOCK_SIZE;
         } else {
@@ -715,19 +681,19 @@ int remove_dir(int fd, inode* dir_inode) {
     size_t this_inode_index;
     inode* parent_inode;
     while (now != NULL) {
-        if (strcmp(now->entry->name, ".") == 0 || strcmp(now->entry->name, "..") == 0) {
-            if (strcmp(now->entry->name, ".") == 0) {
-                this_inode_index = now->entry->inode_index;
+        if (strcmp(now->entry.name, ".") == 0 || strcmp(now->entry.name, "..") == 0) {
+            if (strcmp(now->entry.name, ".") == 0) {
+                this_inode_index = now->entry.inode_index;
             }
-            if (strcmp(now->entry->name, "..") == 0) {
-                parent_inode = get_inode(fd, now->entry->inode_index);
+            if (strcmp(now->entry.name, "..") == 0) {
+                parent_inode = get_inode(fd, now->entry.inode_index);
             }
             now = now->next;
             continue;
         }
-        inode* file_inode = get_inode(fd, now->entry->inode_index);
+        inode* file_inode = get_inode(fd, now->entry.inode_index);
         if (check_directory(file_inode) == FILE_ATTR) {
-            remove_file(fd, dir_inode, file_inode, now->entry->inode_index);
+            remove_file(fd, dir_inode, file_inode, now->entry.inode_index);
         } else {
             remove_dir(fd, file_inode);
         }
@@ -743,135 +709,4 @@ int remove_dir(int fd, inode* dir_inode) {
     free_mappings_list(map_list);
     free_entry_dir_list(dir_list);
     return 0;
-}
-
-int main(int argc, char* argv[]) {
-    int fd = open(FILESYSTEM_FILE, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
-    if (argc > 1 && strcmp(argv[1], "--init") == 0) {
-        init(fd);
-//        exit(EXIT_SUCCESS);
-    }
-    char** current_path = NULL;
-    size_t current_depth = 0;
-    size_t current_inode_index = 1;
-    while (1 == 1) {
-        print_path(current_depth, current_path);
-        printf(" $>");
-        char command[20];
-        scanf("%s", command);
-        if (strcmp(command, "ls") == 0) {
-            char path[BLOCK_SIZE];
-            scanf("%s", path);
-            char** splitted;
-            size_t depth = split_path(path, &splitted);
-            if (path[0] == '/') {
-                list_directory(fd, depth, splitted, 1);
-            } else {
-                list_directory(fd, depth, splitted, current_inode_index);
-            }
-            free_path(splitted, depth);
-        } else if (strcmp(command, "lsdir") == 0) {
-            list_directory(fd, 0, NULL, current_inode_index);
-        } else if (strcmp(command, "mkdir") == 0) {
-            char path[BLOCK_SIZE];
-            scanf("%s", path);
-            char** splitted;
-            size_t depth = split_path(path, &splitted);
-            if (path[0] == '/') {
-                make_dir(fd, depth, splitted, 1);
-            } else {
-                make_dir(fd, depth, splitted, current_inode_index);
-            }
-            free_path(splitted, depth);
-        } else if (strcmp(command, "cd") == 0) {
-            char path[BLOCK_SIZE];
-            scanf("%s", path);
-            char** splitted;
-            size_t len = split_path(path, &splitted);
-            if (path[0] == '/') {
-                get_inode_of_file(fd, splitted, len, 1, &current_inode_index);
-                free_path(current_path, current_depth);
-                current_depth = len;
-                current_path = splitted;
-            } else {
-                if (get_inode_of_file(fd, splitted, len, current_inode_index, &current_inode_index) == NULL) {
-                    printf("Something has gone wrong\n");
-                    continue;
-                }
-                char** new_path;
-                current_depth = concat_paths(current_depth, current_path, len, splitted, &new_path);
-                free(current_path);
-                current_path = new_path;
-                current_depth = canonize_path(&current_path, current_depth);
-            }
-        } else if (strcmp(command, "upload") == 0) {
-            char file_path[BLOCK_SIZE];
-            char fs_path[BLOCK_SIZE];
-            scanf("%s %s", file_path, fs_path);
-            int file_fd = open(file_path, O_RDONLY);
-            if (file_fd == -1) {
-                printf("File don't exists\n");
-                continue;
-            }
-            char** splitted;
-            size_t len = split_path(fs_path, &splitted);
-            if (fs_path[0] == '/') {
-                upload_file(fd, file_fd, splitted, len, ROOT_INODE_INDEX);
-            } else {
-                upload_file(fd, file_fd, splitted, len, current_inode_index);
-            }
-            free_path(splitted, len);
-        } else if (strcmp(command, "cat") == 0) {
-            char path[BLOCK_SIZE];
-            scanf("%s", path);
-            char** splitted;
-            size_t len = split_path(path, &splitted);
-            if (path[0] == '/') {
-                concatenate(fd, splitted, len, ROOT_INODE_INDEX);
-            } else {
-                concatenate(fd, splitted, len, current_inode_index);
-            }
-            free_path(splitted, len);
-        } else if (strcmp(command, "rmf") == 0) {
-            char path[BLOCK_SIZE];
-            scanf("%s", path);
-            char** splitted;
-            size_t len = split_path(path, &splitted);
-            inode* file_inode;
-            inode* folder_inode;
-            size_t file_inode_index;
-            if (path[0] == '/') {
-                file_inode = get_inode_of_file(fd, splitted, len, ROOT_INODE_INDEX, &file_inode_index);
-                folder_inode = get_inode_of_file(fd, splitted, len - 1, ROOT_INODE_INDEX, NULL);
-            } else {
-                file_inode = get_inode_of_file(fd, splitted, len, current_inode_index, &file_inode_index);
-                folder_inode = get_inode_of_file(fd, splitted, len - 1, current_inode_index, NULL);
-            }
-            if (folder_inode == NULL || file_inode == NULL) {
-                printf("%s does not exist\n", path);
-                continue;
-            }
-            if (check_directory(file_inode) == FOLDER_ATTR) {
-                printf("%s is a directory\n", path);
-            }
-            remove_file(fd, folder_inode, file_inode, file_inode_index);
-            free(file_inode);
-        } else if (strcmp(command, "rmd") == 0) {
-            char path[BLOCK_SIZE];
-            scanf("%s", path);
-            char** splitted;
-            size_t len = split_path(path, &splitted);
-            inode* folder_inode;
-            if (path[0] == '/') {
-                folder_inode = get_inode_of_file(fd, splitted, len, ROOT_INODE_INDEX, NULL);
-            } else {
-                folder_inode = get_inode_of_file(fd, splitted, len, current_inode_index, NULL);
-            }
-            remove_dir(fd, folder_inode);
-            free(folder_inode);
-            current_path = NULL;
-            current_inode_index = ROOT_INODE_INDEX;
-            current_depth = 0;
-        }
-    }
 }
